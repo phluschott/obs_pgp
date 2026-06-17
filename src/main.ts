@@ -45,6 +45,9 @@ export default class ObsPgpPlugin extends Plugin {
     this.sessionKey = null;
   }
 
+  // Tracks files currently being written by the plugin to avoid modify-event loops
+  private modifyingFiles = new Set<string>();
+
   activate() {
     this.addRibbonIcon('pencil', 'Sign this note', () => this.signNote());
 
@@ -68,6 +71,23 @@ export default class ObsPgpPlugin extends Plugin {
           menu.addItem((item) =>
             item.setTitle('Sign with PGP key').setIcon('pencil').onClick(() => this.signFile(file))
           );
+        }
+      })
+    );
+
+    // Clear pgp_signed when a signed note is edited
+    this.registerEvent(
+      this.app.vault.on('modify', async (file) => {
+        if (!(file instanceof TFile) || file.extension !== 'md') return;
+        if (this.modifyingFiles.has(file.path)) return;
+        const content = await this.app.vault.read(file);
+        if (/^pgp_signed:\s*true/m.test(content)) {
+          this.modifyingFiles.add(file.path);
+          try {
+            await this.app.vault.modify(file, content.replace(/^pgp_signed:\s*true/m, 'pgp_signed: false'));
+          } finally {
+            this.modifyingFiles.delete(file.path);
+          }
         }
       })
     );
@@ -227,7 +247,12 @@ export default class ObsPgpPlugin extends Plugin {
       updated = `---\npgp_signed: true\n---\n\n${content}`;
     }
 
-    await this.app.vault.modify(file, updated);
+    this.modifyingFiles.add(file.path);
+    try {
+      await this.app.vault.modify(file, updated);
+    } finally {
+      this.modifyingFiles.delete(file.path);
+    }
   }
 
   private async appendToLog(file: TFile) {
