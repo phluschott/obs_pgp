@@ -135,6 +135,29 @@ export default class ObsPgpPlugin extends Plugin {
       : LOG_FILENAME;
   }
 
+  async removeAllData() {
+    const adapter = this.app.vault.adapter;
+
+    // Remove .asc folder recursively
+    const removeDir = async (dirPath: string) => {
+      const listing = await adapter.list(dirPath);
+      for (const file of listing.files) await adapter.remove(file);
+      for (const folder of listing.folders) await removeDir(folder);
+      await adapter.rmdir(dirPath, false);
+    };
+
+    if (await adapter.exists(ASC_FOLDER)) await removeDir(ASC_FOLDER);
+
+    // Remove PGP Log from wherever it currently lives
+    const logPath = this.logPath();
+    if (await adapter.exists(logPath)) await adapter.remove(logPath);
+
+    // Wipe stored key data
+    this.data = Object.assign({}, DEFAULT_DATA);
+    this.sessionKey = null;
+    await this.savePluginData();
+  }
+
   async moveLog(toAscFolder: boolean) {
     const from = toAscFolder ? LOG_FILENAME : `${ASC_FOLDER}/${LOG_FILENAME}`;
     const to   = toAscFolder ? `${ASC_FOLDER}/${LOG_FILENAME}` : LOG_FILENAME;
@@ -278,6 +301,8 @@ export default class ObsPgpPlugin extends Plugin {
       '',
       '> **If a note appears under "Edited since signing"** it has been changed after it was signed.',
       '> The signature on file is for an earlier version of the note. Re-sign it to bring it up to date.',
+      '>',
+      '> **This log updates when Obsidian opens and when you sign a note.** Edits made during your current session will be reflected here the next time you open Obsidian.',
       '',
       `## ✓ Signed (${signed.length})`,
       signed.length === 0
@@ -664,6 +689,27 @@ class ObsPgpSettingTab extends PluginSettingTab {
             'This will create a new PGP keypair. Old signatures cannot be verified with the new key. Continue?',
             'Regenerate',
             () => new RegenerateModal(this.app, this.plugin, () => this.display()).open()
+          ).open();
+        })
+      );
+
+    containerEl.createEl('h3', { text: 'Uninstall', attr: { style: 'margin-top:2em;' } });
+    containerEl.createEl('p', {
+      text: 'Before uninstalling the plugin, click the button below. This removes the .asc signature folder, the PGP Log, and all stored key data from your vault. If you skip this step, those files will remain after the plugin is removed.',
+      attr: { style: 'color:var(--text-muted); font-size:0.9em;' },
+    });
+    new Setting(containerEl)
+      .addButton((btn) =>
+        btn.setButtonText('Remove all plugin data…').setWarning().onClick(() => {
+          new ConfirmModal(
+            this.app,
+            'Remove all plugin data?',
+            'This will permanently delete the .asc folder, PGP Log, and all stored keys. This cannot be undone. Run this before uninstalling the plugin.',
+            'Remove everything',
+            async () => {
+              await this.plugin.removeAllData();
+              new Notice('All plugin data removed. You can now uninstall the plugin.');
+            }
           ).open();
         })
       );
