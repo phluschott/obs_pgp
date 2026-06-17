@@ -47,15 +47,6 @@ export default class ObsPgpPlugin extends Plugin {
 
   // Tracks files currently being written by the plugin to avoid modify-event loops
   private modifyingFiles = new Set<string>();
-  private logRegenTimer: number | null = null;
-
-  scheduleLogRegeneration() {
-    if (this.logRegenTimer) window.clearTimeout(this.logRegenTimer);
-    this.logRegenTimer = window.setTimeout(async () => {
-      this.logRegenTimer = null;
-      await this.regenerateLog();
-    }, 800);
-  }
 
   activate() {
     this.addRibbonIcon('pencil', 'Sign this note', () => this.signNote());
@@ -101,13 +92,8 @@ export default class ObsPgpPlugin extends Plugin {
       })
     );
 
-    // Regenerate log after metadata cache has processed any frontmatter change
-    this.registerEvent(
-      this.app.metadataCache.on('changed', (file) => {
-        if (file.path === this.logPath()) return;
-        this.scheduleLogRegeneration();
-      })
-    );
+    // Regenerate log once on startup after vault is fully loaded
+    this.app.workspace.onLayoutReady(() => this.regenerateLog());
 
     this.addCommand({ id: 'sign-note', name: 'Sign this note', callback: () => this.signNote() });
     this.addCommand({ id: 'verify-signature', name: 'Verify signature', callback: () => this.verifyNote() });
@@ -211,6 +197,8 @@ export default class ObsPgpPlugin extends Plugin {
       await adapter.write(ascPath, signed);
 
       await this.stampFrontmatter(file);
+      // Small delay so metadataCache picks up the frontmatter change before regenerating
+      setTimeout(() => this.regenerateLog(), 800);
 
       new Notice(`"${file.basename}" signed.`);
     } catch (e) {
