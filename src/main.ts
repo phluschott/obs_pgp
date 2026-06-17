@@ -45,11 +45,23 @@ export default class ObsPgpPlugin extends Plugin {
     statusItem.style.cursor = 'pointer';
     statusItem.addEventListener('click', () => this.signNote());
 
+    // Right-click inside the editor
     this.registerEvent(
       this.app.workspace.on('editor-menu', (menu: Menu) => {
         menu.addItem((item) =>
           item.setTitle('Sign with PGP key').setIcon('pencil').onClick(() => this.signNote())
         );
+      })
+    );
+
+    // Right-click on a file in the explorer
+    this.registerEvent(
+      this.app.workspace.on('file-menu', (menu: Menu, file) => {
+        if (file instanceof TFile && file.extension === 'md') {
+          menu.addItem((item) =>
+            item.setTitle('Sign with PGP key').setIcon('pencil').onClick(() => this.signFile(file))
+          );
+        }
       })
     );
 
@@ -92,10 +104,11 @@ export default class ObsPgpPlugin extends Plugin {
   async signNote() {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (!view || !view.file) { new Notice('No active note.'); return; }
+    await this.signFile(view.file);
+  }
 
-    const file: TFile = view.file;
-    const editor: Editor = view.editor;
-    const content = editor.getValue();
+  async signFile(file: TFile) {
+    const content = await this.app.vault.read(file);
 
     try {
       const privateKeyObj = await openpgp.readPrivateKey({ armoredKey: this.data.privateKey });
@@ -110,43 +123,39 @@ export default class ObsPgpPlugin extends Plugin {
       await adapter.write(ascPath, signed);
 
       // Stamp YAML frontmatter so the author can see the note is signed
-      await this.stampFrontmatter(editor);
+      await this.stampFrontmatter(file, content);
 
       // Append to PGP Log
       await this.appendToLog(file);
 
-      new Notice(`Note signed. Signature stored in ${ascPath}`);
+      new Notice(`"${file.basename}" signed.`);
     } catch (e) {
       new Notice('Error signing note: ' + (e as Error).message);
     }
   }
 
-  private async stampFrontmatter(editor: Editor) {
-    let content = editor.getValue();
+  private async stampFrontmatter(file: TFile, content: string) {
     const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    let updated: string;
 
     if (fmMatch) {
-      // Frontmatter exists — add or update pgp_signed
       if (/^pgp_signed:/m.test(fmMatch[1])) {
-        // Already present — ensure it's true
-        content = content.replace(/^pgp_signed:.*$/m, 'pgp_signed: true');
+        updated = content.replace(/^pgp_signed:.*$/m, 'pgp_signed: true');
       } else {
-        // Append inside the frontmatter block
-        content = content.replace(/^---\r?\n([\s\S]*?)\r?\n---/, `---\n$1\npgp_signed: true\n---`);
+        updated = content.replace(/^---\r?\n([\s\S]*?)\r?\n---/, `---\n$1\npgp_signed: true\n---`);
       }
     } else {
-      // No frontmatter — prepend one
-      content = `---\npgp_signed: true\n---\n\n${content}`;
+      updated = `---\npgp_signed: true\n---\n\n${content}`;
     }
 
-    editor.setValue(content);
+    await this.app.vault.modify(file, updated);
   }
 
   async verifyNote() {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (!view || !view.file) { new Notice('No active note.'); return; }
 
-    const file: TFile = view.file;
+    const file = view.file;
     const ascPath = this.ascPathFor(file.path);
     const adapter = this.app.vault.adapter;
 
