@@ -1,8 +1,8 @@
-import { Plugin, PluginSettingTab, App, Setting, Notice, Editor, MarkdownView, Modal, ButtonComponent, Menu, TFile } from 'obsidian';
+import { Plugin, PluginSettingTab, App, Setting, Notice, MarkdownView, Modal, ButtonComponent, Menu, TFile } from 'obsidian';
 import * as openpgp from 'openpgp';
 
 interface PluginData {
-  privateKey: string;
+  privateKey: string;  // armored, passphrase-encrypted
   publicKey: string;
   name: string;
   email: string;
@@ -25,6 +25,9 @@ const LOG_FILENAME = 'PGP Log.md';
 export default class ObsPgpPlugin extends Plugin {
   data: PluginData;
 
+  // Decrypted key cached for the session — never written to disk, cleared on unload
+  private sessionKey: openpgp.PrivateKey | null = null;
+
   async onload() {
     const saved = await this.loadData();
     this.data = Object.assign({}, DEFAULT_DATA, saved);
@@ -38,6 +41,10 @@ export default class ObsPgpPlugin extends Plugin {
     this.activate();
   }
 
+  onunload() {
+    this.sessionKey = null;
+  }
+
   activate() {
     this.addRibbonIcon('pencil', 'Sign this note', () => this.signNote());
 
@@ -47,7 +54,6 @@ export default class ObsPgpPlugin extends Plugin {
     statusItem.style.cursor = 'pointer';
     statusItem.addEventListener('click', () => this.signNote());
 
-    // Right-click inside the editor
     this.registerEvent(
       this.app.workspace.on('editor-menu', (menu: Menu) => {
         menu.addItem((item) =>
@@ -56,7 +62,6 @@ export default class ObsPgpPlugin extends Plugin {
       })
     );
 
-    // Right-click on a file in the explorer
     this.registerEvent(
       this.app.workspace.on('file-menu', (menu: Menu, file) => {
         if (file instanceof TFile && file.extension === 'md') {
@@ -77,11 +82,12 @@ export default class ObsPgpPlugin extends Plugin {
     await this.saveData(this.data);
   }
 
-  async generateKeypair() {
+  async generateKeypair(passphrase: string) {
     const { privateKey, publicKey } = await openpgp.generateKey({
       type: 'rsa',
       rsaBits: 2048,
       userIDs: [{ name: this.data.name, email: this.data.email }],
+      passphrase,
       format: 'armored',
     });
     this.data.privateKey = privateKey;
@@ -89,7 +95,6 @@ export default class ObsPgpPlugin extends Plugin {
     await this.savePluginData();
   }
 
-  // Ensure the .asc folder exists at vault root
   async ensureAscFolder() {
     const adapter = this.app.vault.adapter;
     if (!(await adapter.exists(ASC_FOLDER))) {
@@ -97,8 +102,6 @@ export default class ObsPgpPlugin extends Plugin {
     }
   }
 
-  // Derive the .asc sidecar path for a given vault-relative note path
-  // e.g. "folder/My Note.md" → ".asc/folder/My Note.md.asc"
   ascPathFor(notePath: string): string {
     return `${ASC_FOLDER}/${notePath}.asc`;
   }
@@ -109,7 +112,6 @@ export default class ObsPgpPlugin extends Plugin {
       : LOG_FILENAME;
   }
 
-  // Move the log file when the user toggles its location
   async moveLog(toAscFolder: boolean) {
     const from = toAscFolder ? LOG_FILENAME : `${ASC_FOLDER}/${LOG_FILENAME}`;
     const to   = toAscFolder ? `${ASC_FOLDER}/${LOG_FILENAME}` : LOG_FILENAME;
@@ -123,6 +125,28 @@ export default class ObsPgpPlugin extends Plugin {
     await this.savePluginData();
   }
 
+  // Returns the session-cached decrypted key, prompting for passphrase if needed
+  async getSigningKey(): Promise<openpgp.PrivateKey> {
+    if (this.sessionKey) return this.sessionKey;
+
+    return new Promise((resolve, reject) => {
+      new PassphraseModal(
+        this.app,
+        async (passphrase) => {
+          try {
+            const privateKeyObj = await openpgp.readPrivateKey({ armoredKey: this.data.privateKey });
+            const decrypted = await openpgp.decryptKey({ privateKey: privateKeyObj, passphrase });
+            this.sessionKey = decrypted;
+            resolve(decrypted);
+          } catch {
+            reject(new Error('Incorrect passphrase. Please try again.'));
+          }
+        },
+        () => reject(new Error('Cancelled'))
+      ).open();
+    });
+  }
+
   async signNote() {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (!view || !view.file) { new Notice('No active note.'); return; }
@@ -130,47 +154,32 @@ export default class ObsPgpPlugin extends Plugin {
   }
 
   async signFile(file: TFile) {
-    const content = await this.app.vault.read(file);
+    let signingKey: openpgp.PrivateKey;
+    try {
+      signingKey = await this.getSigningKey();
+    } catch (e) {
+      if ((e as Error).message !== 'Cancelled') new Notice((e as Error).message);
+      return;
+    }
 
     try {
-      const privateKeyObj = await openpgp.readPrivateKey({ armoredKey: this.data.privateKey });
+      const content = await this.app.vault.read(file);
       const message = await openpgp.createCleartextMessage({ text: content });
-      const signed = await openpgp.sign({ message, signingKeys: privateKeyObj });
+      const signed = await openpgp.sign({ message, signingKeys: signingKey });
 
-      // Write sidecar — create parent dirs inside .asc if needed
       const ascPath = this.ascPathFor(file.path);
       const ascDir = ascPath.substring(0, ascPath.lastIndexOf('/'));
       const adapter = this.app.vault.adapter;
       if (!(await adapter.exists(ascDir))) await adapter.mkdir(ascDir);
       await adapter.write(ascPath, signed);
 
-      // Stamp YAML frontmatter so the author can see the note is signed
-      await this.stampFrontmatter(file, content);
-
-      // Append to PGP Log
+      await this.stampFrontmatter(file);
       await this.appendToLog(file);
 
       new Notice(`"${file.basename}" signed.`);
     } catch (e) {
-      new Notice('Error signing note: ' + (e as Error).message);
+      new Notice('Error signing: ' + (e as Error).message);
     }
-  }
-
-  private async stampFrontmatter(file: TFile, content: string) {
-    const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-    let updated: string;
-
-    if (fmMatch) {
-      if (/^pgp_signed:/m.test(fmMatch[1])) {
-        updated = content.replace(/^pgp_signed:.*$/m, 'pgp_signed: true');
-      } else {
-        updated = content.replace(/^---\r?\n([\s\S]*?)\r?\n---/, `---\n$1\npgp_signed: true\n---`);
-      }
-    } else {
-      updated = `---\npgp_signed: true\n---\n\n${content}`;
-    }
-
-    await this.app.vault.modify(file, updated);
   }
 
   async verifyNote() {
@@ -203,6 +212,24 @@ export default class ObsPgpPlugin extends Plugin {
     }
   }
 
+  private async stampFrontmatter(file: TFile) {
+    const content = await this.app.vault.read(file);
+    const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    let updated: string;
+
+    if (fmMatch) {
+      if (/^pgp_signed:/m.test(fmMatch[1])) {
+        updated = content.replace(/^pgp_signed:.*$/m, 'pgp_signed: true');
+      } else {
+        updated = content.replace(/^---\r?\n([\s\S]*?)\r?\n---/, `---\n$1\npgp_signed: true\n---`);
+      }
+    } else {
+      updated = `---\npgp_signed: true\n---\n\n${content}`;
+    }
+
+    await this.app.vault.modify(file, updated);
+  }
+
   private async appendToLog(file: TFile) {
     const adapter = this.app.vault.adapter;
     const logPath = this.logPath();
@@ -221,7 +248,7 @@ export default class ObsPgpPlugin extends Plugin {
 }
 
 // ---------------------------------------------------------------------------
-// Onboarding — 4 steps, no key generated until identity is confirmed
+// Onboarding — 4 steps
 // ---------------------------------------------------------------------------
 
 class OnboardingModal extends Modal {
@@ -229,6 +256,7 @@ class OnboardingModal extends Modal {
   private step = 1;
   private nameValue = '';
   private emailValue = '';
+  private passphrase = '';
 
   constructor(app: App, plugin: ObsPgpPlugin) {
     super(app);
@@ -266,7 +294,7 @@ class OnboardingModal extends Modal {
       attr: { style: 'color: var(--text-muted); font-size: 0.9em;' },
     });
     wrap.createEl('p', {
-      text: 'Setup takes about a minute. You will need a USB drive to safely back up your signing key.',
+      text: 'Setup takes about a minute.',
       attr: { style: 'color: var(--text-muted); font-size: 0.9em;' },
     });
     const footer = wrap.createDiv({ attr: { style: 'margin-top: 2em; text-align: right;' } });
@@ -275,9 +303,9 @@ class OnboardingModal extends Modal {
   }
 
   private renderIdentity(wrap: HTMLElement) {
-    wrap.createEl('h2', { text: 'Your identity' });
+    wrap.createEl('h2', { text: 'Your identity & passphrase' });
     wrap.createEl('p', {
-      text: 'Your name and email address are embedded in your signing key. This is how readers know the signature belongs to you. Use your real name and email so your readers can trust it.',
+      text: 'Your name and email are embedded in your signing key so readers know who signed it. Your passphrase encrypts the key — even if your vault syncs to the cloud, the key is useless without it.',
     });
 
     wrap.createEl('label', { text: 'Full name', attr: { style: 'display:block; margin-top:1em; font-weight:600;' } });
@@ -292,6 +320,28 @@ class OnboardingModal extends Modal {
     });
     emailInput.value = this.emailValue;
 
+    wrap.createEl('label', { text: 'Passphrase', attr: { style: 'display:block; margin-top:1em; font-weight:600;' } });
+    wrap.createEl('p', {
+      text: 'Choose something memorable but hard to guess — you will enter this each time you open Obsidian.',
+      attr: { style: 'font-size:0.85em; color:var(--text-muted); margin:2px 0 4px 0;' },
+    });
+    const passInput = wrap.createEl('input', {
+      attr: { type: 'password', placeholder: 'Passphrase', style: 'width:100%; padding:6px; box-sizing:border-box;' },
+    });
+
+    wrap.createEl('label', { text: 'Confirm passphrase', attr: { style: 'display:block; margin-top:0.75em; font-weight:600;' } });
+    const confirmInput = wrap.createEl('input', {
+      attr: { type: 'password', placeholder: 'Repeat passphrase', style: 'width:100%; padding:6px; box-sizing:border-box; margin-top:4px;' },
+    });
+
+    // Passphrase strength hint
+    const strengthEl = wrap.createEl('p', { attr: { style: 'font-size:0.8em; min-height:1.2em; margin-top:4px;' } });
+    passInput.addEventListener('input', () => {
+      const { label, color } = passphraseStrength(passInput.value);
+      strengthEl.textContent = passInput.value ? `Strength: ${label}` : '';
+      strengthEl.style.color = color;
+    });
+
     const errorEl = wrap.createEl('p', {
       attr: { style: 'color: var(--text-error); font-size:0.85em; min-height:1.2em; margin-top:0.5em;' },
     });
@@ -299,69 +349,89 @@ class OnboardingModal extends Modal {
     const footer = wrap.createDiv({ attr: { style: 'margin-top: 2em; display:flex; justify-content:space-between;' } });
     new ButtonComponent(footer).setButtonText('← Back').onClick(() => { this.step = 1; this.renderStep(); });
 
-    const nextBtn = new ButtonComponent(footer).setButtonText('Next →').setCta();
+    const nextBtn = new ButtonComponent(footer).setButtonText('Generate key →').setCta();
     nextBtn.onClick(async () => {
       const name = nameInput.value.trim();
       const email = emailInput.value.trim();
-      this.nameValue = name;
-      this.emailValue = email;
+      const pass = passInput.value;
+      const confirm = confirmInput.value;
+
       if (!name) { errorEl.textContent = 'Please enter your full name.'; return; }
       if (!email || !email.includes('@')) { errorEl.textContent = 'Please enter a valid email address.'; return; }
+      if (pass.length < 8) { errorEl.textContent = 'Passphrase must be at least 8 characters.'; return; }
+      if (pass !== confirm) { errorEl.textContent = 'Passphrases do not match.'; return; }
+
+      this.nameValue = name;
+      this.emailValue = email;
+      this.passphrase = pass;
 
       nextBtn.setDisabled(true).setButtonText('Generating key…');
       this.plugin.data.name = name;
       this.plugin.data.email = email;
+
       try {
-        await this.plugin.generateKeypair();
+        await this.plugin.generateKeypair(pass);
         this.step = 3;
         this.renderStep();
       } catch (e) {
         errorEl.textContent = 'Failed to generate key: ' + (e as Error).message;
-        nextBtn.setDisabled(false).setButtonText('Next →');
+        nextBtn.setDisabled(false).setButtonText('Generate key →');
       }
     });
   }
 
   private renderBackup(wrap: HTMLElement) {
-    wrap.createEl('h2', { text: 'Back up your signing key' });
-    wrap.createEl('p', { text: 'Your signing key has been created. Now save it to a USB drive and store it somewhere safe.' });
-
-    const list = wrap.createEl('ul', { attr: { style: 'margin: 0.75em 0 0.75em 1.5em;' } });
-    list.createEl('li', { text: 'If you lose this key, you cannot sign from a new device.' });
-    list.createEl('li', { text: 'Keep the private key file confidential — do not share it.' });
-    list.createEl('li', { text: 'Your public key can be shared freely so others can verify your notes.' });
-
-    let savedPrivate = false;
-
-    const btnWrap = wrap.createDiv({ attr: { style: 'margin-top:1.5em; display:flex; gap:8px; flex-wrap:wrap;' } });
-    new ButtonComponent(btnWrap).setButtonText('Save private key (.asc)').setCta().onClick(() => {
-      downloadTextFile('obs-pgp-private.asc', this.plugin.data.privateKey);
-      new Notice('Private key saved — keep it safe!');
-      savedPrivate = true;
-      updateDone();
+    wrap.createEl('h2', { text: 'Save your keys somewhere safe' });
+    wrap.createEl('p', {
+      text: 'Your keys have been generated. They are not written to any file — copy them now to a password manager, USB drive, or other safe location. You will not see them again after this step.',
     });
-    new ButtonComponent(btnWrap).setButtonText('Save public key (.asc)').onClick(() => {
-      downloadTextFile('obs-pgp-public.asc', this.plugin.data.publicKey);
-      new Notice('Public key saved.');
+
+    // Private key
+    wrap.createEl('p', { text: 'Private key (keep this secret):', attr: { style: 'font-weight:600; margin-top:1.25em; margin-bottom:4px;' } });
+    const privArea = wrap.createEl('textarea', {
+      attr: { readonly: 'true', rows: '7', style: 'width:100%;font-family:monospace;font-size:10px;resize:none;box-sizing:border-box;' },
+    });
+    privArea.value = this.plugin.data.privateKey;
+
+    let copiedPrivate = false;
+    const copyPrivBtn = wrap.createEl('button', { text: 'Copy private key', attr: { style: 'margin-top:4px;' } });
+    copyPrivBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(this.plugin.data.privateKey);
+      copyPrivBtn.textContent = 'Copied ✓';
+      copiedPrivate = true;
+      updateNext();
+    });
+
+    // Public key
+    wrap.createEl('p', { text: 'Public key (share this with readers):', attr: { style: 'font-weight:600; margin-top:1.25em; margin-bottom:4px;' } });
+    const pubArea = wrap.createEl('textarea', {
+      attr: { readonly: 'true', rows: '5', style: 'width:100%;font-family:monospace;font-size:10px;resize:none;box-sizing:border-box;' },
+    });
+    pubArea.value = this.plugin.data.publicKey;
+
+    const copyPubBtn = wrap.createEl('button', { text: 'Copy public key', attr: { style: 'margin-top:4px;' } });
+    copyPubBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(this.plugin.data.publicKey);
+      copyPubBtn.textContent = 'Copied ✓';
     });
 
     const hint = wrap.createEl('p', {
-      text: 'Please save your private key before continuing.',
+      text: 'Copy your private key before continuing.',
       attr: { style: 'color: var(--text-muted); font-size:0.85em; margin-top:0.75em;' },
     });
 
-    const footer = wrap.createDiv({ attr: { style: 'margin-top: 2em; text-align:right;' } });
-    const doneBtn = new ButtonComponent(footer).setButtonText('Next →').setDisabled(true);
+    const footer = wrap.createDiv({ attr: { style: 'margin-top: 1.5em; text-align:right;' } });
+    const nextBtn = new ButtonComponent(footer).setButtonText('Next →').setDisabled(true);
 
-    const updateDone = () => {
-      if (savedPrivate) {
-        doneBtn.setDisabled(false).setCta();
-        hint.textContent = 'Key saved. You are ready to sign your notes.';
+    const updateNext = () => {
+      if (copiedPrivate) {
+        nextBtn.setDisabled(false).setCta();
+        hint.textContent = 'Private key copied. Keep it safe — your passphrase is needed to use it.';
         hint.style.color = 'var(--text-success)';
       }
     };
 
-    doneBtn.onClick(() => { this.step = 4; this.renderStep(); });
+    nextBtn.onClick(() => { this.step = 4; this.renderStep(); });
   }
 
   private renderHowToSign(wrap: HTMLElement) {
@@ -370,12 +440,18 @@ class OnboardingModal extends Modal {
 
     const list = wrap.createEl('ol', { attr: { style: 'margin: 0.75em 0 0.75em 1.5em; line-height: 2;' } });
     list.createEl('li', { text: '✍ Click the "Sign" button in the bottom status bar (always visible)' });
-    list.createEl('li', { text: 'Right-click anywhere in a note → "Sign with PGP key"' });
+    list.createEl('li', { text: 'Right-click a note in the file explorer → "Sign with PGP key"' });
     list.createEl('li', { text: 'Press Ctrl+P and type "Sign this note"' });
 
-    wrap.createEl('p', { text: 'Where are my signatures stored?', attr: { style: 'font-weight:600; margin-top:1.25em;' } });
+    wrap.createEl('p', { text: 'About your passphrase', attr: { style: 'font-weight:600; margin-top:1.25em;' } });
     wrap.createEl('p', {
-      text: 'Every signature is saved as a hidden file inside the .asc folder at the root of your vault — your notes are never modified. A PGP Log note is also created at the vault root with a link to every note you sign.',
+      text: 'The first time you sign in each Obsidian session, you will be asked for your passphrase. It is only held in memory while Obsidian is open — never written to disk.',
+      attr: { style: 'color: var(--text-muted); font-size: 0.9em;' },
+    });
+
+    wrap.createEl('p', { text: 'Where are signatures stored?', attr: { style: 'font-weight:600; margin-top:1.25em;' } });
+    wrap.createEl('p', {
+      text: 'Every signature is saved as a hidden file inside the .asc folder at the root of your vault. A PGP Log note records every note you sign.',
       attr: { style: 'color: var(--text-muted); font-size: 0.9em;' },
     });
 
@@ -389,6 +465,55 @@ class OnboardingModal extends Modal {
       new Notice('OBS PGP Signer is ready.');
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Passphrase prompt — shown once per session before first sign
+// ---------------------------------------------------------------------------
+
+class PassphraseModal extends Modal {
+  constructor(
+    app: App,
+    private onSubmit: (passphrase: string) => void,
+    private onCancel: () => void,
+  ) { super(app); }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl('h2', { text: 'Enter your passphrase' });
+    contentEl.createEl('p', {
+      text: 'Your passphrase is needed to unlock your signing key for this session.',
+      attr: { style: 'color:var(--text-muted); font-size:0.9em;' },
+    });
+
+    const input = contentEl.createEl('input', {
+      attr: { type: 'password', placeholder: 'Passphrase', style: 'width:100%; padding:6px; box-sizing:border-box; margin-top:8px;' },
+    });
+
+    const errorEl = contentEl.createEl('p', {
+      attr: { style: 'color:var(--text-error); font-size:0.85em; min-height:1.2em; margin-top:4px;' },
+    });
+
+    const btnDiv = contentEl.createDiv({ attr: { style: 'margin-top:1em; display:flex; gap:8px;' } });
+    const unlockBtn = new ButtonComponent(btnDiv).setButtonText('Unlock').setCta();
+
+    const submit = () => {
+      const val = input.value;
+      if (!val) { errorEl.textContent = 'Please enter your passphrase.'; return; }
+      unlockBtn.setDisabled(true).setButtonText('Unlocking…');
+      this.close();
+      this.onSubmit(val);
+    };
+
+    unlockBtn.onClick(submit);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+    new ButtonComponent(btnDiv).setButtonText('Cancel').onClick(() => { this.close(); this.onCancel(); });
+
+    // Focus the input after the modal opens
+    setTimeout(() => input.focus(), 50);
+  }
+
+  onClose() { this.contentEl.empty(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -413,7 +538,7 @@ class ObsPgpSettingTab extends PluginSettingTab {
       attr: { style: 'color: var(--text-muted);' },
     });
 
-    // Signature storage info box
+    // Storage info box
     const infoBox = containerEl.createDiv({
       attr: { style: 'background:var(--background-secondary); border-radius:6px; padding:12px 16px; margin:1em 0;' },
     });
@@ -431,25 +556,34 @@ class ObsPgpSettingTab extends PluginSettingTab {
           : 'PGP Log is currently at the vault root (PGP Log.md). Toggle to move it inside .asc so it stays out of your way.'
       )
       .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.data.pgpLogInAscFolder)
-          .onChange(async (value) => {
-            await this.plugin.moveLog(value);
-            new Notice(value ? 'PGP Log moved to .asc folder.' : 'PGP Log moved to vault root.');
-            this.display();
-          })
+        toggle.setValue(this.plugin.data.pgpLogInAscFolder).onChange(async (value) => {
+          await this.plugin.moveLog(value);
+          new Notice(value ? 'PGP Log moved to .asc folder.' : 'PGP Log moved to vault root.');
+          this.display();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('Lock session key')
+      .setDesc('Clears the passphrase from memory. You will be prompted again on the next sign.')
+      .addButton((btn) =>
+        btn.setButtonText('Lock').onClick(() => {
+          (this.plugin as any).sessionKey = null;
+          new Notice('Session key cleared — you will be prompted for your passphrase next time.');
+        })
       );
 
     new Setting(containerEl)
       .setName('Import key from another device')
-      .setDesc('Already have a key from another device? Import your private key (.asc) here to sign with the same identity.')
+      .setDesc('Paste your encrypted private key to use the same signing identity on this device.')
       .addButton((btn) =>
         btn.setButtonText('Import key…').onClick(() => {
           new ImportKeyModal(this.app, async (privateKey, publicKey) => {
             this.plugin.data.privateKey = privateKey;
             this.plugin.data.publicKey = publicKey;
+            (this.plugin as any).sessionKey = null;
             await this.plugin.savePluginData();
-            new Notice('Key imported successfully.');
+            new Notice('Key imported. You will be prompted for your passphrase on the next sign.');
             this.display();
           }).open();
         })
@@ -457,7 +591,7 @@ class ObsPgpSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Regenerate keypair')
-      .setDesc('Creates a new key with your current name and email. Old signatures will no longer verify.')
+      .setDesc('Creates a new key. Old signatures will no longer verify.')
       .addButton((btn) =>
         btn.setButtonText('Regenerate…').setWarning().onClick(() => {
           new ConfirmModal(
@@ -465,11 +599,7 @@ class ObsPgpSettingTab extends PluginSettingTab {
             'Regenerate keypair?',
             'This will create a new PGP keypair. Old signatures cannot be verified with the new key. Continue?',
             'Regenerate',
-            async () => {
-              await this.plugin.generateKeypair();
-              new BackupReminderModal(this.app, this.plugin.data.privateKey, this.plugin.data.publicKey).open();
-              this.display();
-            }
+            () => new RegenerateModal(this.app, this.plugin, () => this.display()).open()
           ).open();
         })
       );
@@ -486,27 +616,31 @@ class ObsPgpSettingTab extends PluginSettingTab {
           navigator.clipboard.writeText(this.plugin.data.publicKey);
           new Notice('Public key copied.');
         })
-      )
-      .addButton((btn) =>
-        btn.setButtonText('Save public key (.asc)').onClick(() => {
-          downloadTextFile('obs-pgp-public.asc', this.plugin.data.publicKey);
-        })
       );
 
     const pubKeyArea = containerEl.createEl('textarea', {
-      attr: { readonly: 'true', rows: '10', style: 'width:100%;font-family:monospace;font-size:11px;resize:vertical;margin-top:8px;' },
+      attr: { readonly: 'true', rows: '8', style: 'width:100%;font-family:monospace;font-size:11px;resize:vertical;margin-top:8px;' },
     });
     pubKeyArea.value = this.plugin.data.publicKey;
 
     containerEl.createEl('h3', { text: 'Private key backup', attr: { style: 'margin-top:2em;' } });
+    containerEl.createEl('p', {
+      text: 'This is your passphrase-encrypted private key. Copy it to a password manager or USB drive. It is useless without your passphrase.',
+      attr: { style: 'color: var(--text-muted); font-size:0.9em;' },
+    });
+
     new Setting(containerEl)
-      .setDesc('Save to a USB drive and keep it safe. You need this to sign from a new device.')
       .addButton((btn) =>
-        btn.setButtonText('Save private key (.asc)').setCta().onClick(() => {
-          downloadTextFile('obs-pgp-private.asc', this.plugin.data.privateKey);
-          new Notice('Private key saved — keep it safe!');
+        btn.setButtonText('Copy encrypted private key').setCta().onClick(() => {
+          navigator.clipboard.writeText(this.plugin.data.privateKey);
+          new Notice('Encrypted private key copied.');
         })
       );
+
+    const privKeyArea = containerEl.createEl('textarea', {
+      attr: { readonly: 'true', rows: '8', style: 'width:100%;font-family:monospace;font-size:11px;resize:vertical;margin-top:8px;' },
+    });
+    privKeyArea.value = this.plugin.data.privateKey;
   }
 }
 
@@ -514,22 +648,51 @@ class ObsPgpSettingTab extends PluginSettingTab {
 // Helper modals
 // ---------------------------------------------------------------------------
 
-class BackupReminderModal extends Modal {
-  constructor(app: App, private privateKey: string, private publicKey: string) { super(app); }
+class RegenerateModal extends Modal {
+  constructor(app: App, private plugin: ObsPgpPlugin, private onDone: () => void) { super(app); }
 
   onOpen() {
     const { contentEl } = this;
-    contentEl.createEl('h2', { text: 'Save your new key' });
-    contentEl.createEl('p', { text: 'A new keypair was generated. Save it to your USB drive to replace the old backup.' });
+    contentEl.createEl('h2', { text: 'Choose a passphrase for the new key' });
+
+    contentEl.createEl('label', { text: 'New passphrase', attr: { style: 'display:block; font-weight:600; margin-top:1em;' } });
+    const passInput = contentEl.createEl('input', {
+      attr: { type: 'password', placeholder: 'Passphrase', style: 'width:100%; padding:6px; box-sizing:border-box; margin-top:4px;' },
+    });
+    const strengthEl = contentEl.createEl('p', { attr: { style: 'font-size:0.8em; min-height:1.2em; margin-top:4px;' } });
+    passInput.addEventListener('input', () => {
+      const { label, color } = passphraseStrength(passInput.value);
+      strengthEl.textContent = passInput.value ? `Strength: ${label}` : '';
+      strengthEl.style.color = color;
+    });
+
+    contentEl.createEl('label', { text: 'Confirm passphrase', attr: { style: 'display:block; font-weight:600; margin-top:0.75em;' } });
+    const confirmInput = contentEl.createEl('input', {
+      attr: { type: 'password', placeholder: 'Repeat passphrase', style: 'width:100%; padding:6px; box-sizing:border-box; margin-top:4px;' },
+    });
+
+    const errorEl = contentEl.createEl('p', { attr: { style: 'color:var(--text-error); font-size:0.85em; min-height:1.2em;' } });
+
     const btnDiv = contentEl.createDiv({ attr: { style: 'margin-top:1em; display:flex; gap:8px;' } });
-    new ButtonComponent(btnDiv).setButtonText('Save private key (.asc)').setCta().onClick(() => {
-      downloadTextFile('obs-pgp-private.asc', this.privateKey);
-      new Notice('Private key saved.');
+    const genBtn = new ButtonComponent(btnDiv).setButtonText('Generate').setCta();
+    genBtn.onClick(async () => {
+      const pass = passInput.value;
+      const confirm = confirmInput.value;
+      if (pass.length < 8) { errorEl.textContent = 'Passphrase must be at least 8 characters.'; return; }
+      if (pass !== confirm) { errorEl.textContent = 'Passphrases do not match.'; return; }
+      genBtn.setDisabled(true).setButtonText('Generating…');
+      try {
+        await this.plugin.generateKeypair(pass);
+        (this.plugin as any).sessionKey = null;
+        new Notice('New keypair generated.');
+        this.close();
+        this.onDone();
+      } catch (e) {
+        errorEl.textContent = 'Failed: ' + (e as Error).message;
+        genBtn.setDisabled(false).setButtonText('Generate');
+      }
     });
-    new ButtonComponent(btnDiv).setButtonText('Save public key (.asc)').onClick(() => {
-      downloadTextFile('obs-pgp-public.asc', this.publicKey);
-    });
-    new ButtonComponent(btnDiv).setButtonText('Close').onClick(() => this.close());
+    new ButtonComponent(btnDiv).setButtonText('Cancel').onClick(() => this.close());
   }
 
   onClose() { this.contentEl.empty(); }
@@ -541,10 +704,12 @@ class ImportKeyModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.createEl('h2', { text: 'Import existing key' });
-    contentEl.createEl('p', { text: 'Paste the contents of your obs-pgp-private.asc file below.' });
+    contentEl.createEl('p', {
+      text: 'Paste the encrypted private key you copied during setup. You will be prompted for its passphrase the next time you sign.',
+    });
 
     const textarea = contentEl.createEl('textarea', {
-      attr: { rows: '14', placeholder: '-----BEGIN PGP PRIVATE KEY BLOCK-----\n...', style: 'width:100%;font-family:monospace;font-size:11px;resize:vertical;margin-top:8px;' },
+      attr: { rows: '12', placeholder: '-----BEGIN PGP PRIVATE KEY BLOCK-----\n...', style: 'width:100%;font-family:monospace;font-size:11px;resize:vertical;margin-top:8px;' },
     });
     const errorEl = contentEl.createEl('p', { attr: { style: 'color:var(--text-error);font-size:0.85em;min-height:1.2em;' } });
     const btnDiv = contentEl.createDiv({ attr: { style: 'margin-top:0.5em; display:flex; gap:8px;' } });
@@ -592,17 +757,18 @@ class ConfirmModal extends Modal {
 }
 
 // ---------------------------------------------------------------------------
-// Utility
+// Utilities
 // ---------------------------------------------------------------------------
 
-function downloadTextFile(filename: string, content: string) {
-  const blob = new Blob([content], { type: 'text/plain' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+function passphraseStrength(pass: string): { label: string; color: string } {
+  if (pass.length < 8)  return { label: 'Too short', color: 'var(--text-error)' };
+  if (pass.length < 12) return { label: 'Weak', color: 'orange' };
+  const hasUpper = /[A-Z]/.test(pass);
+  const hasLower = /[a-z]/.test(pass);
+  const hasDigit = /[0-9]/.test(pass);
+  const hasSymbol = /[^A-Za-z0-9]/.test(pass);
+  const variety = [hasUpper, hasLower, hasDigit, hasSymbol].filter(Boolean).length;
+  if (pass.length >= 16 && variety >= 3) return { label: 'Strong', color: 'var(--text-success)' };
+  if (pass.length >= 12 && variety >= 2) return { label: 'Good', color: 'var(--color-green)' };
+  return { label: 'Fair', color: 'orange' };
 }
