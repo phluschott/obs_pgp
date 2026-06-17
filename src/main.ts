@@ -1,4 +1,4 @@
-import { Plugin, PluginSettingTab, App, Setting, Notice, Editor, MarkdownView, Modal, ButtonComponent } from 'obsidian';
+import { Plugin, PluginSettingTab, App, Setting, Notice, Editor, MarkdownView, Modal, ButtonComponent, Menu } from 'obsidian';
 import * as openpgp from 'openpgp';
 
 interface PluginData {
@@ -39,6 +39,25 @@ export default class ObsPgpPlugin extends Plugin {
     this.ribbonIcon = this.addRibbonIcon('pencil', 'Sign this note', () => {
       this.signNote();
     });
+
+    // Status bar button
+    const statusItem = this.addStatusBarItem();
+    statusItem.setText('✍ Sign');
+    statusItem.title = 'Sign this note with your PGP key';
+    statusItem.style.cursor = 'pointer';
+    statusItem.addEventListener('click', () => this.signNote());
+
+    // Right-click context menu in editor
+    this.registerEvent(
+      this.app.workspace.on('editor-menu', (menu: Menu) => {
+        menu.addItem((item) => {
+          item
+            .setTitle('Sign with PGP key')
+            .setIcon('pencil')
+            .onClick(() => this.signNote());
+        });
+      })
+    );
 
     this.addCommand({
       id: 'sign-note',
@@ -147,14 +166,15 @@ class OnboardingModal extends Modal {
 
     const wrap = contentEl.createDiv({ cls: 'obs-pgp-step' });
 
-    const stepLabel = wrap.createEl('p', {
-      text: `Step ${this.step} of 3`,
+    wrap.createEl('p', {
+      text: `Step ${this.step} of 4`,
       attr: { style: 'color: var(--text-muted); font-size: 0.8em; margin-bottom: 0.25em;' },
     });
 
     if (this.step === 1) this.renderWelcome(wrap);
     else if (this.step === 2) this.renderIdentity(wrap);
-    else this.renderBackup(wrap);
+    else if (this.step === 3) this.renderBackup(wrap);
+    else this.renderHowToSign(wrap);
   }
 
   private renderWelcome(wrap: HTMLElement) {
@@ -283,13 +303,37 @@ class OnboardingModal extends Modal {
       }
     };
 
-    doneBtn.onClick(async () => {
-      this.plugin.data.onboardingComplete = true;
-      await this.plugin.savePluginData();
-      this.close();
-      this.plugin.activate();
-      new Notice('OBS PGP Signer is ready.');
+    doneBtn.onClick(() => {
+      this.step = 4;
+      this.renderStep();
     });
+  }
+
+  private renderHowToSign(wrap: HTMLElement) {
+    wrap.createEl('h2', { text: 'You\'re all set — here\'s how to sign' });
+    wrap.createEl('p', { text: 'There are three ways to sign any note:' });
+
+    const list = wrap.createEl('ol', { attr: { style: 'margin: 0.75em 0 0.75em 1.5em; line-height: 2;' } });
+    list.createEl('li', { text: '✍ Click the "Sign" button in the bottom status bar (always visible)' });
+    list.createEl('li', { text: 'Right-click anywhere in a note → "Sign with PGP key"' });
+    list.createEl('li', { text: 'Press Ctrl+P and type "Sign this note"' });
+
+    wrap.createEl('p', {
+      text: 'Signing adds a PGP signature block to the bottom of your note. Share the note and your public key with readers — they can use it to verify the note is genuinely yours.',
+      attr: { style: 'margin-top: 1em; color: var(--text-muted); font-size: 0.9em;' },
+    });
+
+    const footer = wrap.createDiv({ attr: { style: 'margin-top: 2em; text-align: right;' } });
+    new ButtonComponent(footer)
+      .setButtonText('Start signing →')
+      .setCta()
+      .onClick(async () => {
+        this.plugin.data.onboardingComplete = true;
+        await this.plugin.savePluginData();
+        this.close();
+        this.plugin.activate();
+        new Notice('OBS PGP Signer is ready.');
+      });
   }
 }
 
