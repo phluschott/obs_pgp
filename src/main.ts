@@ -1,4 +1,4 @@
-import { Plugin, PluginSettingTab, App, Setting, Notice, Editor, MarkdownView, Modal, ButtonComponent } from 'obsidian';
+import { Plugin, PluginSettingTab, App, Setting, Notice, Editor, MarkdownView, Modal, ButtonComponent, Menu, TFile } from 'obsidian';
 import * as openpgp from 'openpgp';
 
 interface PluginData {
@@ -17,11 +17,11 @@ const DEFAULT_DATA: PluginData = {
   onboardingComplete: false,
 };
 
-const SIGNATURE_DELIMITER = '\n\n---\n<!-- obs-pgp-signature -->\n';
+const ASC_FOLDER = '.asc';
+const LOG_FILE = 'PGP Log.md';
 
 export default class ObsPgpPlugin extends Plugin {
   data: PluginData;
-  private ribbonIcon: HTMLElement | null = null;
 
   async onload() {
     const saved = await this.loadData();
@@ -32,25 +32,29 @@ export default class ObsPgpPlugin extends Plugin {
       return;
     }
 
+    await this.ensureAscFolder();
     this.activate();
   }
 
   activate() {
-    this.ribbonIcon = this.addRibbonIcon('pencil', 'Sign this note', () => {
-      this.signNote();
-    });
+    this.addRibbonIcon('pencil', 'Sign this note', () => this.signNote());
 
-    this.addCommand({
-      id: 'sign-note',
-      name: 'Sign this note',
-      callback: () => this.signNote(),
-    });
+    const statusItem = this.addStatusBarItem();
+    statusItem.setText('✍ Sign');
+    statusItem.title = 'Sign this note with your PGP key';
+    statusItem.style.cursor = 'pointer';
+    statusItem.addEventListener('click', () => this.signNote());
 
-    this.addCommand({
-      id: 'verify-signature',
-      name: 'Verify signature',
-      callback: () => this.verifyNote(),
-    });
+    this.registerEvent(
+      this.app.workspace.on('editor-menu', (menu: Menu) => {
+        menu.addItem((item) =>
+          item.setTitle('Sign with PGP key').setIcon('pencil').onClick(() => this.signNote())
+        );
+      })
+    );
+
+    this.addCommand({ id: 'sign-note', name: 'Sign this note', callback: () => this.signNote() });
+    this.addCommand({ id: 'verify-signature', name: 'Verify signature', callback: () => this.verifyNote() });
 
     this.addSettingTab(new ObsPgpSettingTab(this.app, this));
   }
@@ -71,59 +75,121 @@ export default class ObsPgpPlugin extends Plugin {
     await this.savePluginData();
   }
 
+  // Ensure the .asc folder exists at vault root
+  async ensureAscFolder() {
+    const adapter = this.app.vault.adapter;
+    if (!(await adapter.exists(ASC_FOLDER))) {
+      await adapter.mkdir(ASC_FOLDER);
+    }
+  }
+
+  // Derive the .asc sidecar path for a given vault-relative note path
+  // e.g. "folder/My Note.md" → ".asc/folder/My Note.md.asc"
+  ascPathFor(notePath: string): string {
+    return `${ASC_FOLDER}/${notePath}.asc`;
+  }
+
   async signNote() {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (!view) { new Notice('No active note.'); return; }
+    if (!view || !view.file) { new Notice('No active note.'); return; }
 
+    const file: TFile = view.file;
     const editor: Editor = view.editor;
-    let content = editor.getValue();
-
-    const delimIdx = content.indexOf('\n\n---\n<!-- obs-pgp-signature -->');
-    if (delimIdx !== -1) content = content.substring(0, delimIdx);
+    const content = editor.getValue();
 
     try {
       const privateKeyObj = await openpgp.readPrivateKey({ armoredKey: this.data.privateKey });
       const message = await openpgp.createCleartextMessage({ text: content });
       const signed = await openpgp.sign({ message, signingKeys: privateKeyObj });
-      editor.setValue(content + SIGNATURE_DELIMITER + signed);
-      new Notice('Note signed.');
+
+      // Write sidecar — create parent dirs inside .asc if needed
+      const ascPath = this.ascPathFor(file.path);
+      const ascDir = ascPath.substring(0, ascPath.lastIndexOf('/'));
+      const adapter = this.app.vault.adapter;
+      if (!(await adapter.exists(ascDir))) await adapter.mkdir(ascDir);
+      await adapter.write(ascPath, signed);
+
+      // Stamp YAML frontmatter so the author can see the note is signed
+      await this.stampFrontmatter(editor);
+
+      // Append to PGP Log
+      await this.appendToLog(file);
+
+      new Notice(`Note signed. Signature stored in ${ascPath}`);
     } catch (e) {
       new Notice('Error signing note: ' + (e as Error).message);
     }
   }
 
+  private async stampFrontmatter(editor: Editor) {
+    let content = editor.getValue();
+    const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+
+    if (fmMatch) {
+      // Frontmatter exists — add or update pgp_signed
+      if (/^pgp_signed:/m.test(fmMatch[1])) {
+        // Already present — ensure it's true
+        content = content.replace(/^pgp_signed:.*$/m, 'pgp_signed: true');
+      } else {
+        // Append inside the frontmatter block
+        content = content.replace(/^---\r?\n([\s\S]*?)\r?\n---/, `---\n$1\npgp_signed: true\n---`);
+      }
+    } else {
+      // No frontmatter — prepend one
+      content = `---\npgp_signed: true\n---\n\n${content}`;
+    }
+
+    editor.setValue(content);
+  }
+
   async verifyNote() {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (!view) { new Notice('No active note.'); return; }
+    if (!view || !view.file) { new Notice('No active note.'); return; }
 
-    const content = view.editor.getValue();
-    const startMarker = '-----BEGIN PGP SIGNED MESSAGE-----';
-    const endMarker = '-----END PGP SIGNATURE-----';
-    const startIdx = content.indexOf(startMarker);
-    if (startIdx === -1) { new Notice('No signature block found.'); return; }
-    const endIdx = content.indexOf(endMarker, startIdx);
-    if (endIdx === -1) { new Notice('Malformed signature block.'); return; }
+    const file: TFile = view.file;
+    const ascPath = this.ascPathFor(file.path);
+    const adapter = this.app.vault.adapter;
+
+    if (!(await adapter.exists(ascPath))) {
+      new Notice('No signature found for this note.');
+      return;
+    }
 
     try {
+      const armoredSigned = await adapter.read(ascPath);
       const publicKeyObj = await openpgp.readKey({ armoredKey: this.data.publicKey });
-      const message = await openpgp.readCleartextMessage({
-        cleartextMessage: content.substring(startIdx, endIdx + endMarker.length),
-      });
+      const message = await openpgp.readCleartextMessage({ cleartextMessage: armoredSigned });
       const result = await openpgp.verify({ message, verificationKeys: publicKeyObj });
+
       try {
         await result.signatures[0].verified;
-        new Notice('Signature valid ✓');
+        new Notice('Signature valid ✓ — note has not been altered since signing.');
       } catch {
-        new Notice('Signature INVALID ✗');
+        new Notice('Signature INVALID ✗ — note may have been modified after signing.');
       }
     } catch (e) {
       new Notice('Error verifying: ' + (e as Error).message);
     }
   }
+
+  private async appendToLog(file: TFile) {
+    const adapter = this.app.vault.adapter;
+    const timestamp = new Date().toLocaleString();
+    const noteLink = `[[${file.path.replace(/\.md$/, '')}]]`;
+    const entry = `- ${noteLink} — signed ${timestamp}\n`;
+
+    if (await adapter.exists(LOG_FILE)) {
+      const existing = await adapter.read(LOG_FILE);
+      await adapter.write(LOG_FILE, existing + entry);
+    } else {
+      const header = `# PGP Log\n\nA record of every note signed with your PGP key. Signature files are stored in the \`.asc\` folder.\n\n`;
+      await adapter.write(LOG_FILE, header + entry);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Onboarding — three steps, no key generated until identity is confirmed
+// Onboarding — 4 steps, no key generated until identity is confirmed
 // ---------------------------------------------------------------------------
 
 class OnboardingModal extends Modal {
@@ -144,17 +210,15 @@ class OnboardingModal extends Modal {
   private renderStep() {
     const { contentEl } = this;
     contentEl.empty();
-
     const wrap = contentEl.createDiv({ cls: 'obs-pgp-step' });
-
-    const stepLabel = wrap.createEl('p', {
-      text: `Step ${this.step} of 3`,
+    wrap.createEl('p', {
+      text: `Step ${this.step} of 4`,
       attr: { style: 'color: var(--text-muted); font-size: 0.8em; margin-bottom: 0.25em;' },
     });
-
     if (this.step === 1) this.renderWelcome(wrap);
     else if (this.step === 2) this.renderIdentity(wrap);
-    else this.renderBackup(wrap);
+    else if (this.step === 3) this.renderBackup(wrap);
+    else this.renderHowToSign(wrap);
   }
 
   private renderWelcome(wrap: HTMLElement) {
@@ -166,14 +230,15 @@ class OnboardingModal extends Modal {
       text: 'Your signature is unique to you. Readers can use your public key to verify that a note genuinely came from you.',
     });
     wrap.createEl('p', {
+      text: 'Your notes are never modified. Signatures are stored invisibly in a hidden .asc folder at the root of your vault, so your writing stays clean.',
+      attr: { style: 'color: var(--text-muted); font-size: 0.9em;' },
+    });
+    wrap.createEl('p', {
       text: 'Setup takes about a minute. You will need a USB drive to safely back up your signing key.',
       attr: { style: 'color: var(--text-muted); font-size: 0.9em;' },
     });
-
     const footer = wrap.createDiv({ attr: { style: 'margin-top: 2em; text-align: right;' } });
-    new ButtonComponent(footer)
-      .setButtonText('Get started →')
-      .setCta()
+    new ButtonComponent(footer).setButtonText('Get started →').setCta()
       .onClick(() => { this.step = 2; this.renderStep(); });
   }
 
@@ -183,13 +248,13 @@ class OnboardingModal extends Modal {
       text: 'Your name and email address are embedded in your signing key. This is how readers know the signature belongs to you. Use your real name and email so your readers can trust it.',
     });
 
-    const nameLabel = wrap.createEl('label', { text: 'Full name', attr: { style: 'display:block; margin-top:1em; font-weight:600;' } });
+    wrap.createEl('label', { text: 'Full name', attr: { style: 'display:block; margin-top:1em; font-weight:600;' } });
     const nameInput = wrap.createEl('input', {
       attr: { type: 'text', placeholder: 'e.g. Jane Smith', style: 'width:100%; margin-top:4px; padding:6px; box-sizing:border-box;' },
     });
     nameInput.value = this.nameValue;
 
-    const emailLabel = wrap.createEl('label', { text: 'Email address', attr: { style: 'display:block; margin-top:1em; font-weight:600;' } });
+    wrap.createEl('label', { text: 'Email address', attr: { style: 'display:block; margin-top:1em; font-weight:600;' } });
     const emailInput = wrap.createEl('input', {
       attr: { type: 'email', placeholder: 'e.g. jane@example.com', style: 'width:100%; margin-top:4px; padding:6px; box-sizing:border-box;' },
     });
@@ -200,28 +265,20 @@ class OnboardingModal extends Modal {
     });
 
     const footer = wrap.createDiv({ attr: { style: 'margin-top: 2em; display:flex; justify-content:space-between;' } });
+    new ButtonComponent(footer).setButtonText('← Back').onClick(() => { this.step = 1; this.renderStep(); });
 
-    new ButtonComponent(footer)
-      .setButtonText('← Back')
-      .onClick(() => { this.step = 1; this.renderStep(); });
-
-    const nextBtn = new ButtonComponent(footer)
-      .setButtonText('Next →')
-      .setCta();
-
+    const nextBtn = new ButtonComponent(footer).setButtonText('Next →').setCta();
     nextBtn.onClick(async () => {
       const name = nameInput.value.trim();
       const email = emailInput.value.trim();
       this.nameValue = name;
       this.emailValue = email;
-
       if (!name) { errorEl.textContent = 'Please enter your full name.'; return; }
       if (!email || !email.includes('@')) { errorEl.textContent = 'Please enter a valid email address.'; return; }
 
       nextBtn.setDisabled(true).setButtonText('Generating key…');
       this.plugin.data.name = name;
       this.plugin.data.email = email;
-
       try {
         await this.plugin.generateKeypair();
         this.step = 3;
@@ -235,35 +292,26 @@ class OnboardingModal extends Modal {
 
   private renderBackup(wrap: HTMLElement) {
     wrap.createEl('h2', { text: 'Back up your signing key' });
-    wrap.createEl('p', {
-      text: 'Your signing key has been created. Now save it to a USB drive and store it somewhere safe.',
-    });
+    wrap.createEl('p', { text: 'Your signing key has been created. Now save it to a USB drive and store it somewhere safe.' });
 
     const list = wrap.createEl('ul', { attr: { style: 'margin: 0.75em 0 0.75em 1.5em;' } });
     list.createEl('li', { text: 'If you lose this key, you cannot sign from a new device.' });
     list.createEl('li', { text: 'Keep the private key file confidential — do not share it.' });
     list.createEl('li', { text: 'Your public key can be shared freely so others can verify your notes.' });
 
-    const btnWrap = wrap.createDiv({ attr: { style: 'margin-top:1.5em; display:flex; gap:8px; flex-wrap:wrap;' } });
-
-    new ButtonComponent(btnWrap)
-      .setButtonText('Save private key (.asc)')
-      .setCta()
-      .onClick(() => {
-        downloadTextFile('obs-pgp-private.asc', this.plugin.data.privateKey);
-        new Notice('Private key saved — keep it safe!');
-        savedPrivate = true;
-        updateDone();
-      });
-
-    new ButtonComponent(btnWrap)
-      .setButtonText('Save public key (.asc)')
-      .onClick(() => {
-        downloadTextFile('obs-pgp-public.asc', this.plugin.data.publicKey);
-        new Notice('Public key saved.');
-      });
-
     let savedPrivate = false;
+
+    const btnWrap = wrap.createDiv({ attr: { style: 'margin-top:1.5em; display:flex; gap:8px; flex-wrap:wrap;' } });
+    new ButtonComponent(btnWrap).setButtonText('Save private key (.asc)').setCta().onClick(() => {
+      downloadTextFile('obs-pgp-private.asc', this.plugin.data.privateKey);
+      new Notice('Private key saved — keep it safe!');
+      savedPrivate = true;
+      updateDone();
+    });
+    new ButtonComponent(btnWrap).setButtonText('Save public key (.asc)').onClick(() => {
+      downloadTextFile('obs-pgp-public.asc', this.plugin.data.publicKey);
+      new Notice('Public key saved.');
+    });
 
     const hint = wrap.createEl('p', {
       text: 'Please save your private key before continuing.',
@@ -271,9 +319,7 @@ class OnboardingModal extends Modal {
     });
 
     const footer = wrap.createDiv({ attr: { style: 'margin-top: 2em; text-align:right;' } });
-    const doneBtn = new ButtonComponent(footer)
-      .setButtonText('Done — start signing')
-      .setDisabled(true);
+    const doneBtn = new ButtonComponent(footer).setButtonText('Next →').setDisabled(true);
 
     const updateDone = () => {
       if (savedPrivate) {
@@ -283,9 +329,29 @@ class OnboardingModal extends Modal {
       }
     };
 
-    doneBtn.onClick(async () => {
+    doneBtn.onClick(() => { this.step = 4; this.renderStep(); });
+  }
+
+  private renderHowToSign(wrap: HTMLElement) {
+    wrap.createEl('h2', { text: 'You\'re all set — here\'s how to sign' });
+    wrap.createEl('p', { text: 'There are three ways to sign any note:' });
+
+    const list = wrap.createEl('ol', { attr: { style: 'margin: 0.75em 0 0.75em 1.5em; line-height: 2;' } });
+    list.createEl('li', { text: '✍ Click the "Sign" button in the bottom status bar (always visible)' });
+    list.createEl('li', { text: 'Right-click anywhere in a note → "Sign with PGP key"' });
+    list.createEl('li', { text: 'Press Ctrl+P and type "Sign this note"' });
+
+    wrap.createEl('p', { text: 'Where are my signatures stored?', attr: { style: 'font-weight:600; margin-top:1.25em;' } });
+    wrap.createEl('p', {
+      text: 'Every signature is saved as a hidden file inside the .asc folder at the root of your vault — your notes are never modified. A PGP Log note is also created at the vault root with a link to every note you sign.',
+      attr: { style: 'color: var(--text-muted); font-size: 0.9em;' },
+    });
+
+    const footer = wrap.createDiv({ attr: { style: 'margin-top: 2em; text-align: right;' } });
+    new ButtonComponent(footer).setButtonText('Start signing →').setCta().onClick(async () => {
       this.plugin.data.onboardingComplete = true;
       await this.plugin.savePluginData();
+      await this.plugin.ensureAscFolder();
       this.close();
       this.plugin.activate();
       new Notice('OBS PGP Signer is ready.');
@@ -315,6 +381,16 @@ class ObsPgpSettingTab extends PluginSettingTab {
       attr: { style: 'color: var(--text-muted);' },
     });
 
+    // Signature storage info box
+    const infoBox = containerEl.createDiv({
+      attr: { style: 'background:var(--background-secondary); border-radius:6px; padding:12px 16px; margin:1em 0;' },
+    });
+    infoBox.createEl('p', { text: 'Where are signatures stored?', attr: { style: 'font-weight:600; margin:0 0 4px 0;' } });
+    infoBox.createEl('p', {
+      text: 'Signature files (.asc) are saved in the .asc folder at the root of your vault. Your notes are never modified. A PGP Log.md file at the vault root links to every note you have signed.',
+      attr: { style: 'margin:0; font-size:0.9em; color:var(--text-muted);' },
+    });
+
     new Setting(containerEl)
       .setName('Import key from another device')
       .setDesc('Already have a key from another device? Import your private key (.asc) here to sign with the same identity.')
@@ -334,22 +410,19 @@ class ObsPgpSettingTab extends PluginSettingTab {
       .setName('Regenerate keypair')
       .setDesc('Creates a new key with your current name and email. Old signatures will no longer verify.')
       .addButton((btn) =>
-        btn
-          .setButtonText('Regenerate…')
-          .setWarning()
-          .onClick(() => {
-            new ConfirmModal(
-              this.app,
-              'Regenerate keypair?',
-              'This will create a new PGP keypair. Old signatures cannot be verified with the new key. Continue?',
-              'Regenerate',
-              async () => {
-                await this.plugin.generateKeypair();
-                new BackupReminderModal(this.app, this.plugin.data.privateKey, this.plugin.data.publicKey).open();
-                this.display();
-              }
-            ).open();
-          })
+        btn.setButtonText('Regenerate…').setWarning().onClick(() => {
+          new ConfirmModal(
+            this.app,
+            'Regenerate keypair?',
+            'This will create a new PGP keypair. Old signatures cannot be verified with the new key. Continue?',
+            'Regenerate',
+            async () => {
+              await this.plugin.generateKeypair();
+              new BackupReminderModal(this.app, this.plugin.data.privateKey, this.plugin.data.publicKey).open();
+              this.display();
+            }
+          ).open();
+        })
       );
 
     containerEl.createEl('h3', { text: 'Your public key', attr: { style: 'margin-top:2em;' } });
@@ -378,7 +451,7 @@ class ObsPgpSettingTab extends PluginSettingTab {
 
     containerEl.createEl('h3', { text: 'Private key backup', attr: { style: 'margin-top:2em;' } });
     new Setting(containerEl)
-      .setDesc('Save to a USB drive and keep it safe.')
+      .setDesc('Save to a USB drive and keep it safe. You need this to sign from a new device.')
       .addButton((btn) =>
         btn.setButtonText('Save private key (.asc)').setCta().onClick(() => {
           downloadTextFile('obs-pgp-private.asc', this.plugin.data.privateKey);
@@ -393,14 +466,7 @@ class ObsPgpSettingTab extends PluginSettingTab {
 // ---------------------------------------------------------------------------
 
 class BackupReminderModal extends Modal {
-  private privateKey: string;
-  private publicKey: string;
-
-  constructor(app: App, privateKey: string, publicKey: string) {
-    super(app);
-    this.privateKey = privateKey;
-    this.publicKey = publicKey;
-  }
+  constructor(app: App, private privateKey: string, private publicKey: string) { super(app); }
 
   onOpen() {
     const { contentEl } = this;
@@ -421,12 +487,7 @@ class BackupReminderModal extends Modal {
 }
 
 class ImportKeyModal extends Modal {
-  private onImport: (privateKey: string, publicKey: string) => void;
-
-  constructor(app: App, onImport: (privateKey: string, publicKey: string) => void) {
-    super(app);
-    this.onImport = onImport;
-  }
+  constructor(app: App, private onImport: (privateKey: string, publicKey: string) => void) { super(app); }
 
   onOpen() {
     const { contentEl } = this;
@@ -436,10 +497,9 @@ class ImportKeyModal extends Modal {
     const textarea = contentEl.createEl('textarea', {
       attr: { rows: '14', placeholder: '-----BEGIN PGP PRIVATE KEY BLOCK-----\n...', style: 'width:100%;font-family:monospace;font-size:11px;resize:vertical;margin-top:8px;' },
     });
-
     const errorEl = contentEl.createEl('p', { attr: { style: 'color:var(--text-error);font-size:0.85em;min-height:1.2em;' } });
-
     const btnDiv = contentEl.createDiv({ attr: { style: 'margin-top:0.5em; display:flex; gap:8px;' } });
+
     const importBtn = new ButtonComponent(btnDiv).setButtonText('Import').setCta();
     importBtn.onClick(async () => {
       errorEl.textContent = '';
@@ -474,7 +534,8 @@ class ConfirmModal extends Modal {
     contentEl.createEl('h2', { text: this.title });
     contentEl.createEl('p', { text: this.body });
     const btnDiv = contentEl.createDiv({ attr: { style: 'margin-top:1em; display:flex; gap:8px;' } });
-    new ButtonComponent(btnDiv).setButtonText(this.confirmLabel).setWarning().onClick(() => { this.close(); this.onConfirm(); });
+    new ButtonComponent(btnDiv).setButtonText(this.confirmLabel).setWarning()
+      .onClick(() => { this.close(); this.onConfirm(); });
     new ButtonComponent(btnDiv).setButtonText('Cancel').onClick(() => this.close());
   }
 
