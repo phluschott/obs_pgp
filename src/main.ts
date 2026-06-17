@@ -75,7 +75,7 @@ export default class ObsPgpPlugin extends Plugin {
       })
     );
 
-    // Clear pgp_signed when a signed note is edited
+    // Clear pgp_signed and refresh log when a signed note is edited
     this.registerEvent(
       this.app.vault.on('modify', async (file) => {
         if (!(file instanceof TFile) || file.extension !== 'md') return;
@@ -88,6 +88,7 @@ export default class ObsPgpPlugin extends Plugin {
           } finally {
             this.modifyingFiles.delete(file.path);
           }
+          await this.regenerateLog();
         }
       })
     );
@@ -194,7 +195,7 @@ export default class ObsPgpPlugin extends Plugin {
       await adapter.write(ascPath, signed);
 
       await this.stampFrontmatter(file);
-      await this.appendToLog(file);
+      await this.regenerateLog();
 
       new Notice(`"${file.basename}" signed.`);
     } catch (e) {
@@ -255,19 +256,44 @@ export default class ObsPgpPlugin extends Plugin {
     }
   }
 
-  private async appendToLog(file: TFile) {
-    const adapter = this.app.vault.adapter;
+  async regenerateLog() {
+    const signed: TFile[] = [];
+    const modified: TFile[] = [];
     const logPath = this.logPath();
-    const timestamp = new Date().toLocaleString();
-    const noteLink = `[[${file.path.replace(/\.md$/, '')}]]`;
-    const entry = `- ${noteLink} — signed ${timestamp}\n`;
 
-    if (await adapter.exists(logPath)) {
-      const existing = await adapter.read(logPath);
-      await adapter.write(logPath, existing + entry);
-    } else {
-      const header = `# PGP Log\n\nA record of every note signed with your PGP key. Signature files are stored in the \`.asc\` folder.\n\n`;
-      await adapter.write(logPath, header + entry);
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (file.path === logPath) continue;
+      const status = this.app.metadataCache.getFileCache(file)?.frontmatter?.pgp_signed;
+      if (status === true) signed.push(file);
+      else if (status === false) modified.push(file);
+    }
+
+    const lines = [
+      '# PGP Log',
+      '',
+      'Signature files are stored in the `.asc` folder.',
+      '',
+      '> **If a note appears under "Edited since signing"** it has been changed after it was signed.',
+      '> The signature on file is for an earlier version of the note. Re-sign it to bring it up to date.',
+      '',
+      `## ✓ Signed (${signed.length})`,
+      signed.length === 0
+        ? '_No signed notes yet._'
+        : signed.map(f => `- [[${f.path.replace(/\.md$/, '')}]]`).join('\n'),
+      '',
+      `## ✎ Edited since signing (${modified.length})`,
+      modified.length === 0
+        ? '_None — all signed notes are up to date._'
+        : modified.map(f => `- [[${f.path.replace(/\.md$/, '')}]]`).join('\n'),
+      '',
+      `_Last updated: ${new Date().toLocaleString()}_`,
+    ];
+
+    this.modifyingFiles.add(logPath);
+    try {
+      await this.app.vault.adapter.write(logPath, lines.join('\n') + '\n');
+    } finally {
+      this.modifyingFiles.delete(logPath);
     }
   }
 }
@@ -476,7 +502,13 @@ class OnboardingModal extends Modal {
 
     wrap.createEl('p', { text: 'Where are signatures stored?', attr: { style: 'font-weight:600; margin-top:1.25em;' } });
     wrap.createEl('p', {
-      text: 'Every signature is saved as a hidden file inside the .asc folder at the root of your vault. A PGP Log note records every note you sign.',
+      text: 'Every signature is saved as a hidden file inside the .asc folder at the root of your vault. A PGP Log note at the vault root lists all your signed notes and their current status.',
+      attr: { style: 'color: var(--text-muted); font-size: 0.9em;' },
+    });
+
+    wrap.createEl('p', { text: 'What happens if I edit a signed note?', attr: { style: 'font-weight:600; margin-top:1.25em;' } });
+    wrap.createEl('p', {
+      text: 'The moment you make a change, the note\'s pgp_signed property automatically flips to false — a clear signal that the current version is not signed. The PGP Log updates instantly to move it into the "Edited since signing" section. Simply re-sign the note to bring the signature up to date.',
       attr: { style: 'color: var(--text-muted); font-size: 0.9em;' },
     });
 
@@ -567,9 +599,13 @@ class ObsPgpSettingTab extends PluginSettingTab {
     const infoBox = containerEl.createDiv({
       attr: { style: 'background:var(--background-secondary); border-radius:6px; padding:12px 16px; margin:1em 0;' },
     });
-    infoBox.createEl('p', { text: 'Where are signatures stored?', attr: { style: 'font-weight:600; margin:0 0 4px 0;' } });
+    infoBox.createEl('p', { text: 'How signatures work', attr: { style: 'font-weight:600; margin:0 0 6px 0;' } });
     infoBox.createEl('p', {
-      text: 'Signature files (.asc) are saved in the .asc folder at the root of your vault. Your notes are never modified. A PGP Log.md file links to every note you have signed.',
+      text: 'Signature files (.asc) are saved in the .asc folder at the root of your vault — your notes are never modified by signing.',
+      attr: { style: 'margin:0 0 6px 0; font-size:0.9em; color:var(--text-muted);' },
+    });
+    infoBox.createEl('p', {
+      text: 'The PGP Log lists all signed notes and their current status. If you edit a signed note, its pgp_signed property automatically flips to false and the PGP Log moves it to the "Edited since signing" section — a clear signal that the current version is not covered by the signature. Re-sign the note to update it.',
       attr: { style: 'margin:0; font-size:0.9em; color:var(--text-muted);' },
     });
 
