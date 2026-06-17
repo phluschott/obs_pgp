@@ -7,7 +7,7 @@ esbuild.build({
   bundle: true,
   external: ["obsidian"],
   format: "cjs",
-  platform: "node",
+  platform: "browser",
   target: "es2018",
   outfile: "main.js",
   sourcemap: prod ? false : "inline",
