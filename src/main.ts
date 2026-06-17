@@ -47,6 +47,15 @@ export default class ObsPgpPlugin extends Plugin {
 
   // Tracks files currently being written by the plugin to avoid modify-event loops
   private modifyingFiles = new Set<string>();
+  private logRegenTimer: number | null = null;
+
+  scheduleLogRegeneration() {
+    if (this.logRegenTimer) window.clearTimeout(this.logRegenTimer);
+    this.logRegenTimer = window.setTimeout(async () => {
+      this.logRegenTimer = null;
+      await this.regenerateLog();
+    }, 800);
+  }
 
   activate() {
     this.addRibbonIcon('pencil', 'Sign this note', () => this.signNote());
@@ -88,8 +97,15 @@ export default class ObsPgpPlugin extends Plugin {
           } finally {
             this.modifyingFiles.delete(file.path);
           }
-          await this.regenerateLog();
         }
+      })
+    );
+
+    // Regenerate log after metadata cache has processed any frontmatter change
+    this.registerEvent(
+      this.app.metadataCache.on('changed', (file) => {
+        if (file.path === this.logPath()) return;
+        this.scheduleLogRegeneration();
       })
     );
 
@@ -195,7 +211,6 @@ export default class ObsPgpPlugin extends Plugin {
       await adapter.write(ascPath, signed);
 
       await this.stampFrontmatter(file);
-      await this.regenerateLog();
 
       new Notice(`"${file.basename}" signed.`);
     } catch (e) {
