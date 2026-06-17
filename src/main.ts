@@ -278,6 +278,8 @@ export default class ObsPgpPlugin extends Plugin {
       '',
       '> **If a note appears under "Edited since signing"** it has been changed after it was signed.',
       '> The signature on file is for an earlier version of the note. Re-sign it to bring it up to date.',
+      '>',
+      '> **This log updates when Obsidian opens and when you sign a note.** Edits made during your current session will be reflected here the next time you open Obsidian.',
       '',
       `## ✓ Signed (${signed.length})`,
       signed.length === 0
