@@ -1,0 +1,9 @@
+{
+  "id": "obs-pgp",
+  "name": "OBS PGP Signer",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Sign and verify your notes with OpenPGP.",
+  "author": "obs_pgp",
+  "isDesktopOnly": false
+}
