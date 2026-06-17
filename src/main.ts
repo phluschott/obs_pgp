@@ -7,6 +7,7 @@ interface PluginData {
   name: string;
   email: string;
   onboardingComplete: boolean;
+  pgpLogInAscFolder: boolean;
 }
 
 const DEFAULT_DATA: PluginData = {
@@ -15,10 +16,11 @@ const DEFAULT_DATA: PluginData = {
   name: '',
   email: '',
   onboardingComplete: false,
+  pgpLogInAscFolder: false,
 };
 
 const ASC_FOLDER = '.asc';
-const LOG_FILE = 'PGP Log.md';
+const LOG_FILENAME = 'PGP Log.md';
 
 export default class ObsPgpPlugin extends Plugin {
   data: PluginData;
@@ -99,6 +101,26 @@ export default class ObsPgpPlugin extends Plugin {
   // e.g. "folder/My Note.md" → ".asc/folder/My Note.md.asc"
   ascPathFor(notePath: string): string {
     return `${ASC_FOLDER}/${notePath}.asc`;
+  }
+
+  logPath(): string {
+    return this.data.pgpLogInAscFolder
+      ? `${ASC_FOLDER}/${LOG_FILENAME}`
+      : LOG_FILENAME;
+  }
+
+  // Move the log file when the user toggles its location
+  async moveLog(toAscFolder: boolean) {
+    const from = toAscFolder ? LOG_FILENAME : `${ASC_FOLDER}/${LOG_FILENAME}`;
+    const to   = toAscFolder ? `${ASC_FOLDER}/${LOG_FILENAME}` : LOG_FILENAME;
+    const adapter = this.app.vault.adapter;
+    if (await adapter.exists(from)) {
+      const contents = await adapter.read(from);
+      await adapter.write(to, contents);
+      await adapter.remove(from);
+    }
+    this.data.pgpLogInAscFolder = toAscFolder;
+    await this.savePluginData();
   }
 
   async signNote() {
@@ -183,16 +205,17 @@ export default class ObsPgpPlugin extends Plugin {
 
   private async appendToLog(file: TFile) {
     const adapter = this.app.vault.adapter;
+    const logPath = this.logPath();
     const timestamp = new Date().toLocaleString();
     const noteLink = `[[${file.path.replace(/\.md$/, '')}]]`;
     const entry = `- ${noteLink} — signed ${timestamp}\n`;
 
-    if (await adapter.exists(LOG_FILE)) {
-      const existing = await adapter.read(LOG_FILE);
-      await adapter.write(LOG_FILE, existing + entry);
+    if (await adapter.exists(logPath)) {
+      const existing = await adapter.read(logPath);
+      await adapter.write(logPath, existing + entry);
     } else {
       const header = `# PGP Log\n\nA record of every note signed with your PGP key. Signature files are stored in the \`.asc\` folder.\n\n`;
-      await adapter.write(LOG_FILE, header + entry);
+      await adapter.write(logPath, header + entry);
     }
   }
 }
@@ -396,9 +419,26 @@ class ObsPgpSettingTab extends PluginSettingTab {
     });
     infoBox.createEl('p', { text: 'Where are signatures stored?', attr: { style: 'font-weight:600; margin:0 0 4px 0;' } });
     infoBox.createEl('p', {
-      text: 'Signature files (.asc) are saved in the .asc folder at the root of your vault. Your notes are never modified. A PGP Log.md file at the vault root links to every note you have signed.',
+      text: 'Signature files (.asc) are saved in the .asc folder at the root of your vault. Your notes are never modified. A PGP Log.md file links to every note you have signed.',
       attr: { style: 'margin:0; font-size:0.9em; color:var(--text-muted);' },
     });
+
+    new Setting(containerEl)
+      .setName('Move PGP Log inside .asc folder')
+      .setDesc(
+        this.plugin.data.pgpLogInAscFolder
+          ? 'PGP Log is currently stored in .asc/PGP Log.md — hidden from your vault file list.'
+          : 'PGP Log is currently at the vault root (PGP Log.md). Toggle to move it inside .asc so it stays out of your way.'
+      )
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.data.pgpLogInAscFolder)
+          .onChange(async (value) => {
+            await this.plugin.moveLog(value);
+            new Notice(value ? 'PGP Log moved to .asc folder.' : 'PGP Log moved to vault root.');
+            this.display();
+          })
+      );
 
     new Setting(containerEl)
       .setName('Import key from another device')
